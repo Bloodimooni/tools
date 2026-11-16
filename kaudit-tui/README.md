@@ -40,7 +40,7 @@ Regenerate it with `go run ./internal/gen > testdata/sample.jsonl`.
 | space | mark an event, or a whole group. `M` clears all marks |
 | `w` | export marked events as `./kaudit-export-<ts>.jsonl`. With nothing marked, it exports the current event, group, or filtered set |
 | `n` / `N` | next / previous event in the detail view |
-| `?` / `q` | help / quit |
+| `?` / `:q` | help / quit |
 
 ## Layout scaling
 

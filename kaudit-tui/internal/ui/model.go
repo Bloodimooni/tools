@@ -62,6 +62,7 @@ type Model struct {
 
 	input    textinput.Model
 	inputOn  bool
+	cmdOn    bool // input line is a ":" command, not a filter
 	showHelp bool
 	status   string
 	width    int
@@ -86,7 +87,7 @@ func New(events []audit.Event, by audit.GroupBy, header string) Model {
 	}
 	ti := textinput.New()
 	ti.Prompt = "/ "
-	ti.Placeholder = "user:alice verb:delete res:secrets ns:prod code:>=400 -verb:watch text…"
+	ti.Placeholder = filterPlaceholder
 	ti.CharLimit = 500
 	m.input = ti
 	m.vp = viewport.New(80, 20)
@@ -199,13 +200,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateTime(msg)
 		}
 		switch msg.String() {
-		case "ctrl+c", "q":
+		case "ctrl+c":
 			return m, tea.Quit
+		case ":":
+			m.inputOn, m.cmdOn = true, true
+			m.input.Prompt, m.input.Placeholder = ":", ""
+			m.input.SetValue("")
+			return m, m.input.Focus()
 		case "?":
 			m.showHelp = true
 			return m, nil
 		case "/":
-			m.inputOn = true
+			m.inputOn, m.cmdOn = true, false
+			m.input.Prompt, m.input.Placeholder = "/ ", filterPlaceholder
 			m.input.SetValue(m.fText)
 			m.input.CursorEnd()
 			return m, m.input.Focus()
@@ -244,9 +251,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+const filterPlaceholder = "user:alice verb:delete res:secrets ns:prod code:>=400 -verb:watch text…"
+
 func (m Model) updateInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "enter":
+		if m.cmdOn {
+			m.inputOn = false
+			m.input.Blur()
+			switch c := strings.TrimSpace(m.input.Value()); c {
+			case "q", "q!", "quit", "qa", "wq", "x":
+				return m, tea.Quit
+			case "":
+			default:
+				m.status = "unknown command: " + c
+			}
+			return m, nil
+		}
 		f, err := audit.ParseFilter(m.input.Value())
 		if err != nil {
 			m.status = "filter error: " + err.Error()
@@ -298,7 +319,7 @@ func (m Model) updateTime(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.refresh()
 		m.buildHist()
 		m.status = fmt.Sprintf("zoomed to %s – %s  (0 resets)", fmtTime(m.winFrom), fmtTime(m.winTo))
-	case "esc", "t", "q":
+	case "esc", "t":
 		m.timeMode, m.hSel = false, -1
 	case "0":
 		m.winFrom, m.winTo = time.Time{}, time.Time{}
@@ -623,7 +644,7 @@ VIEWS
 NAVIGATION
   ↑/↓ j/k  move          pgup/pgdn  page       g/G  top/bottom
   enter    open          esc        back (in groups: clear filter, then zoom)
-  q        quit          ?          this help
+  :q       quit          ?          this help
 
 GROUPING
   b / B    cycle group-by: similar, user, resource, verb, namespace, sourceIP, userAgent, status, none
