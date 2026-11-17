@@ -71,6 +71,9 @@ func (m Model) View() string {
 
 func (m *Model) headerLine() string {
 	parts := []string{sPill.Render("kaudit"), sMuted.Render(m.header)}
+	if m.live > 0 {
+		parts = append(parts, sErr.Render("●")+sMuted.Render(" live"))
+	}
 	parts = append(parts, sBold.Render(fmtInt(len(m.filtered)))+sMuted.Render("/"+fmtInt(len(m.all))+" events"))
 	if m.fText != "" {
 		parts = append(parts, sKey.Render("filter: ")+m.fText)

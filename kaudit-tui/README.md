@@ -17,6 +17,26 @@ kubectl logs ... | ./kaudit-tui -           # stdin
 ./kaudit-tui --summary --top 30 audit.log   # non-interactive: histogram + top groups
 ```
 
+### Remote and live sources
+
+A source can be a local file, `-` for stdin, or `ssh://[user@]host[:port]/path`. Several sources are merged into one timeline. `-f` / `--follow` keeps streaming new events into the open UI (`tail -F`, so log rotation is handled):
+
+```sh
+# live view across all three control-plane nodes
+./kaudit-tui -f --sudo \
+  ssh://admin@master-1/var/log/kubernetes/audit.log \
+  ssh://admin@master-2/var/log/kubernetes/audit.log \
+  ssh://admin@master-3/var/log/kubernetes/audit.log
+
+./kaudit-tui ssh://master-1/var/log/kubernetes/audit-2026-11-14.log.gz   # one-shot remote read
+```
+
+- ssh runs with `BatchMode=yes`, so it never prompts for a password. Use keys or an agent. Host aliases from `~/.ssh/config` work.
+- `--sudo` runs the remote `tail`/`cat` via `sudo -n`, because audit logs are usually root-only. This needs passwordless sudo.
+- `--backlog N` (default 10000): lines of existing log each source reads before following. `-1` reads the whole file.
+- While streaming, the header shows `● live`. If a source dies (unreachable host, permission denied), the footer shows ssh's error and the other sources keep running.
+- The histogram range grows with new events. Zooming in pins the window.
+
 Flags:
 - `--group-by similar|user|resource|verb|namespace|sourceIP|userAgent|status|none`
 - `--stage`: default `ResponseComplete`. This avoids counting each request twice. Use `--stage ''` for all stages.

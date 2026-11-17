@@ -2,12 +2,14 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -26,9 +28,13 @@ func main() {
 		stage   = flag.String("stage", "ResponseComplete", "only keep events of this stage (empty = all stages)")
 		filterS = flag.String("filter", "", "initial filter expression, e.g. 'code:>=400 -verb:watch'")
 		width   = flag.Int("width", 0, "chart width for --summary (default: terminal width or 100)")
+		follow  = flag.Bool("follow", false, "stream new events live (tail -F) from every source")
+		backlog = flag.Int("backlog", 10000, "with --follow: lines of existing log to read first per source (-1 = whole file)")
+		sudo    = flag.Bool("sudo", false, "ssh:// sources: read the remote log via `sudo -n`")
 	)
+	flag.BoolVar(follow, "f", false, "shorthand for --follow")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: %s [flags] audit.log [more.log.gz ...]   (use - for stdin)\n\n", filepath.Base(os.Args[0]))
+		fmt.Fprintf(os.Stderr, "usage: %s [flags] SOURCE...\n\nSOURCE is a local file (.gz ok), - for stdin, or ssh://[user@]host[:port]/path\n\n", filepath.Base(os.Args[0]))
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -45,15 +51,24 @@ func main() {
 		fail(err)
 	}
 
+	if *follow {
+		if *summary {
+			fail(fmt.Errorf("--summary and --follow cannot be combined"))
+		}
+		runFollow(flag.Args(), by, filter, *filterS, audit.LoadOptions{Stage: *stage},
+			audit.SourceOptions{Follow: true, Backlog: *backlog, Sudo: *sudo})
+		return
+	}
+
 	fmt.Fprintf(os.Stderr, "loading %s…\n", strings.Join(flag.Args(), ", "))
-	res, err := audit.LoadFiles(flag.Args(), audit.LoadOptions{Stage: *stage})
+	res, err := audit.LoadFiles(flag.Args(), audit.LoadOptions{Stage: *stage, Sudo: *sudo})
 	if err != nil {
 		fail(err)
 	}
 	if len(res.Events) == 0 && res.Skipped > 0 {
 		// log has no events of the requested stage; fall back to everything
 		fmt.Fprintf(os.Stderr, "no %s events found, using all stages\n", *stage)
-		res, err = audit.LoadFiles(flag.Args(), audit.LoadOptions{})
+		res, err = audit.LoadFiles(flag.Args(), audit.LoadOptions{Sudo: *sudo})
 		if err != nil {
 			fail(err)
 		}
@@ -85,9 +100,98 @@ func main() {
 
 func describeInputs(paths []string) string {
 	if len(paths) == 1 {
+		if strings.HasPrefix(paths[0], "ssh://") {
+			return paths[0]
+		}
 		return filepath.Base(paths[0])
 	}
-	return fmt.Sprintf("%d files", len(paths))
+	return fmt.Sprintf("%d sources", len(paths))
+}
+
+// runFollow starts the TUI empty and streams events from every source into it.
+func runFollow(specs []string, by audit.GroupBy, filter *audit.Filter, filterS string, lopt audit.LoadOptions, sopt audit.SourceOptions) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var srcs []*audit.Source
+	for _, spec := range specs {
+		src, err := audit.OpenSource(ctx, spec, sopt)
+		if err != nil {
+			cancel()
+			fail(fmt.Errorf("%s: %w", spec, err))
+		}
+		srcs = append(srcs, src)
+	}
+
+	header := describeInputs(specs)
+	if lopt.Stage != "" {
+		header += " · stage=" + lopt.Stage
+	}
+	m := ui.New(nil, by, header).WithLive(len(srcs))
+	if !filter.Empty() {
+		m = m.WithFilter(filterS, filter)
+	}
+	p := tea.NewProgram(m, tea.WithAltScreen())
+
+	for _, src := range srcs {
+		go streamSource(ctx, p, src, lopt)
+	}
+	_, err := p.Run()
+	cancel()
+	for _, src := range srcs {
+		src.Close()
+	}
+	if err != nil {
+		fail(err)
+	}
+}
+
+// streamSource parses one source and delivers events to the UI in batches,
+// so a burst of thousands of lines causes a few re-renders, not thousands.
+func streamSource(ctx context.Context, p *tea.Program, src *audit.Source, opt audit.LoadOptions) {
+	var (
+		mu    sync.Mutex
+		batch []audit.Event
+	)
+	flush := func() {
+		mu.Lock()
+		b := batch
+		batch = nil
+		mu.Unlock()
+		if len(b) > 0 {
+			p.Send(ui.EventsMsg(b))
+		}
+	}
+	done := make(chan struct{})
+	go func() {
+		t := time.NewTicker(250 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				flush()
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	var res audit.LoadResult
+	err := audit.Scan(src, opt, &res, func(e audit.Event) {
+		mu.Lock()
+		batch = append(batch, e)
+		mu.Unlock()
+	})
+	close(done)
+	flush()
+	if ctx.Err() != nil {
+		return // we are shutting down
+	}
+	src.Wait() // reap the child so its stderr is complete
+	msg := src.Err()
+	if msg == "" && err != nil {
+		msg = err.Error()
+	}
+	p.Send(ui.SourceDoneMsg{Name: src.Name, Err: msg})
 }
 
 func printSummary(events []audit.Event, by audit.GroupBy, f *audit.Filter, top, width int) {

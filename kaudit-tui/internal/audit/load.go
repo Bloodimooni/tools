@@ -4,9 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"fmt"
 	"io"
-	"os"
 	"sort"
 	"strings"
 )
@@ -24,6 +24,7 @@ type LoadOptions struct {
 	// usually log RequestReceived and ResponseComplete for the same request,
 	// so defaulting to ResponseComplete avoids double counting.
 	Stage string
+	Sudo  bool // ssh:// sources: read via `sudo -n`
 }
 
 // LoadFiles reads JSON-lines audit logs. "-" reads stdin. Files ending in .gz
@@ -40,18 +41,11 @@ func LoadFiles(paths []string, opt LoadOptions) (*LoadResult, error) {
 }
 
 func loadOne(path string, opt LoadOptions, res *LoadResult) error {
-	var r io.Reader
-	if path == "-" {
-		r = os.Stdin
-	} else {
-		f, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-		defer f.Close()
-		r = f
+	src, err := OpenSource(context.Background(), path, SourceOptions{Sudo: opt.Sudo})
+	if err != nil {
+		return err
 	}
-	br := bufio.NewReaderSize(r, 1<<20)
+	br := bufio.NewReaderSize(src, 1<<20)
 	// detect gzip by magic bytes, not only by extension
 	if magic, _ := br.Peek(2); len(magic) == 2 && magic[0] == 0x1f && magic[1] == 0x8b {
 		gz, err := gzip.NewReader(br)
@@ -61,11 +55,27 @@ func loadOne(path string, opt LoadOptions, res *LoadResult) error {
 		defer gz.Close()
 		br = bufio.NewReaderSize(gz, 1<<20)
 	}
-	return Read(br, opt, res)
+	if err := Read(br, opt, res); err != nil {
+		src.Close()
+		return err
+	}
+	if err := src.Wait(); err != nil {
+		if msg := src.Err(); msg != "" {
+			return fmt.Errorf("%w: %s", err, msg)
+		}
+		return err
+	}
+	return nil
 }
 
 // Read parses JSON-lines from r into res.
 func Read(r io.Reader, opt LoadOptions, res *LoadResult) error {
+	return Scan(r, opt, res, func(e Event) { res.Events = append(res.Events, e) })
+}
+
+// Scan parses JSON-lines from r and calls emit for every kept event until r
+// ends. Bad and skipped lines are counted in res; res.Events is not touched.
+func Scan(r io.Reader, opt LoadOptions, res *LoadResult, emit func(Event)) error {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 1<<20), 64<<20)
 	for sc.Scan() {
@@ -85,7 +95,7 @@ func Read(r io.Reader, opt LoadOptions, res *LoadResult) error {
 			res.Skipped++
 			continue
 		}
-		res.Events = append(res.Events, e)
+		emit(e)
 	}
 	return sc.Err()
 }

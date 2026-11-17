@@ -68,6 +68,46 @@ type Model struct {
 	width    int
 	height   int
 	header   string
+	live     int // follow mode: number of sources still streaming
+}
+
+// EventsMsg delivers newly streamed events (follow mode).
+type EventsMsg []audit.Event
+
+// SourceDoneMsg reports that a streamed source ended.
+type SourceDoneMsg struct {
+	Name string
+	Err  string
+}
+
+// WithLive marks the model as following n streaming sources.
+func (m Model) WithLive(n int) Model {
+	m.live = n
+	return m
+}
+
+// addEvents merges streamed events into the model, keeping m.all sorted.
+func (m *Model) addEvents(evs []audit.Event) {
+	if len(evs) == 0 {
+		return
+	}
+	sorted := true
+	for i := range evs {
+		e := &evs[i]
+		if n := len(m.all); n > 0 && e.Time.Before(m.all[n-1].Time) {
+			sorted = false // multiple sources interleave slightly out of order
+		}
+		m.all = append(m.all, e)
+	}
+	if !sorted {
+		sort.SliceStable(m.all, func(i, j int) bool { return m.all[i].Time.Before(m.all[j].Time) })
+	}
+	m.minT, m.maxT = m.all[0].Time, m.all[len(m.all)-1].Time
+	m.refresh()
+	if m.width > 0 {
+		m.buildHist()
+		m.ensureVisible()
+	}
 }
 
 // New builds a model over the given events (must be sorted by time).
@@ -180,6 +220,16 @@ func (m *Model) buildHist() {
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case EventsMsg:
+		m.addEvents(msg)
+		return m, nil
+	case SourceDoneMsg:
+		m.live--
+		m.status = "stream " + msg.Name + " ended"
+		if msg.Err != "" {
+			m.status += ": " + msg.Err
+		}
+		return m, nil
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.vp.Width, m.vp.Height = msg.Width, max(3, msg.Height-3)
